@@ -1,0 +1,955 @@
+/*
+ * MarchingCubes.cc
+ *
+ *  Created on: 2010/12/27
+ *      Author: umakatsu
+ */
+
+#include "Reconstruction/MarchingCubes.h"
+
+#include <GL/gl.h>
+#include <GL/glu.h>
+
+#include <cmath>
+#include <float.h>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include "Reconstruction/Tables.h"
+#include "Image/BmpFileIO.h"
+
+#include <boost/foreach.hpp>
+#include "Model/Model.h"
+
+#include "myVector.h"
+
+namespace PTAMM{
+#define MAPMETHOD 2
+const int VERTICESLIMIT = 60000; // 65536 is right number
+
+//namespace definition
+using namespace std;
+
+namespace{
+	TooN::Vector< 2 > projectionFromWorldToImage(const TooN::Vector< 3 > & point , const TooN::SE3<> &  se3CFromW , ATANCamera & camera){
+	    TooN::Vector< 3 > v3Cam = se3CFromW * point;
+	    TooN::Vector< 2 > v2ImPlane = project(v3Cam);
+	    TooN::Vector< 2 > v2Image = camera.Project(v2ImPlane);
+		return v2Image;
+	}
+}
+
+/*
+ * constructor
+ * @param size : cube size
+ * @param isolevel : threshold value
+ */
+//MarchingCubes::MarchingCubes(int size, double isolevel)
+//: SIZE(size) , mIsoLevel(isolevel)
+//{
+//	mGridCells = NULL;
+//	mGridPoints = NULL;
+//	allocateTables();
+//	texture.clear();
+//}
+
+MarchingCubes::MarchingCubes(int size, double isolevel , const ATANCamera & acam)
+: SIZE(size) , mIsoLevel(isolevel) , mpCamera(acam)
+{
+	mGridCells 	= NULL;
+	mGridPoints 	= NULL;
+	mTriangles 	= NULL;
+	gravity = Zeros;
+	allocateTables();
+	texture.clear();
+}
+
+MarchingCubes::~MarchingCubes(void) {
+	deallocateTables();
+}
+
+int MarchingCubes::run() {
+	//テクスチャデータがないと処理を行わない
+	if( texture.size() > 0){
+		//領域がない場合は確保のみ行う
+		texSize = static_cast< int >(texture.size());
+		if(mTriangles == NULL){
+			mTriangles = new deque<Triangle>[ ( texSize + 1 ) ];
+#if MAPMETHOD == 2
+			mTriangles_damy = new deque<Triangle>[ ( texSize + 1 ) ];
+#endif
+		}
+		//領域解放後、再度領域確保
+		else{
+			delete[] mTriangles;
+			mTriangles = new deque<Triangle>[ ( texSize + 1 ) ];
+#if MAPMETHOD == 2
+			delete[] mTriangles_damy;
+			mTriangles_damy = new deque<Triangle>[ ( texSize + 1 ) ];
+#endif
+			}
+//		mTriangles.clear();
+		int triCount = 0;
+		for (int i = 0; i < SIZE; i += OFFSET) {
+			for (int j = 0; j < SIZE; j += OFFSET) {
+				for (int k = 0; k < SIZE; k += OFFSET) {
+					triCount += polygoniseAndInsert(&mGridCells[i][j][k], mIsoLevel);
+				}
+			}
+		}
+#if MAPMETHOD == 2
+		gravity /= triCount;
+		// 各カメラの単位球体における自己位置を算出
+		BOOST_FOREACH(TextureInfo *t , texture){
+			TooN::Vector<3> cam = t->camerapose.inverse().get_translation();
+			double dist = norm3( cam - gravity);
+			t->camera_ref =( cam + ( dist - 1.0 )*gravity ) / dist;
+//			cout << t->camera_ref << endl;
+//			cout << gravity << endl;
+////			cout << t->camera_ref-gravity << endl;
+//			cout << "t:" << t->texture_number << "=" << norm3(t->camera_ref - gravity) << endl;
+		}
+		// 各メッシュにマッピングするテクスチャを決める
+		REP(tnum,texSize+1){
+			deque<Triangle>::iterator i;
+			for (i = mTriangles_damy[tnum].begin(); i != mTriangles_damy[tnum].end(); i++) {
+				calculateTexture(*i);
+				if( (*i).texture_number >= 0) mTriangles[(*i).texture_number].push_back((*i));
+				else mTriangles[texSize].push_back((*i));
+			}
+		}
+#endif
+		triangleSize = triCount;
+		return triCount;
+	}else{
+		return 0;
+	}
+}
+
+void MarchingCubes::reset( void ){
+
+}
+
+/*
+ * 生成したデータの保存
+ */
+void MarchingCubes::save(const char * filename){
+	// Creation of the reserved directory
+	ostringstream directoryName;
+	ostringstream com;
+	directoryName << "~/NewARDiorama/ARDiorama/ARData/Models/ReconstructedObjects/" << filename;
+	com << "mkdir " << directoryName.str().c_str();
+	if( system( com.str().c_str() ) );
+
+	// Creation of a 3DS file
+	Lib3dsFile * sModel = lib3ds_file_new();
+	strcpy( sModel->name , filename);
+	// Reserve the material setting
+	sModel->nmaterials = texSize;
+	sModel->materials = new Lib3dsMaterial*[texSize];
+	REP(m,texSize){
+
+		ostringstream textureFilename;
+		textureFilename << "texture" << m;
+		sModel->materials[m] = lib3ds_material_new(textureFilename.str().c_str() );
+		textureFilename << ".bmp";
+		strcpy( sModel->materials[m]->texture1_map.name , textureFilename.str().c_str() );
+		if(m < texSize){
+			// Create BMP File
+			uchar *buf	= new uchar[WIDTH * HEIGHT * 3 ];
+			// read color image
+			myReadRawimage( texture.at(m)->imRGB , buf);
+			// 上下反転
+			REP(i , HEIGHT/2){
+				REP(j,WIDTH){
+					REP(k,3){
+						swap(buf[(i*WIDTH + j)*3 + k] ,
+							 buf[( ((HEIGHT-1) - i ) * WIDTH + j ) * 3 + k]);
+					}
+				}
+			}
+			BmpFileIO	b;
+			b.WriteRGB( textureFilename.str().c_str(), WIDTH , HEIGHT , buf);
+			delete[] buf;
+		}
+	}
+
+	// Reserve the mesh
+	// First, the number of meshes are calculated
+//	int meshParts = floor( static_cast< double >( triangleSize) / VERTICESLIMIT );
+	sModel->nmeshes = texSize;
+	sModel->meshes = new Lib3dsMesh*[texSize];
+	REP(tnum,texSize){
+		ostringstream meshFilename;
+		meshFilename << "mesh" << tnum;
+//		cout << meshFilename.str().c_str() << endl;
+		sModel->meshes[tnum] = lib3ds_mesh_new( meshFilename.str().c_str() );
+		// Creating temporary memory for data of face
+		int faceSum = mTriangles[tnum].size();
+		sModel->meshes[tnum]->faces = new Lib3dsFace[faceSum];
+		sModel->meshes[tnum]->vertices = new float[faceSum*3][3];
+		sModel->meshes[tnum]->texcos = new float[faceSum*3][2];
+		// Reserve the vertices information
+		deque<Triangle>::iterator i;
+		int face_number = 0;
+		for (i = mTriangles[tnum].begin(); i != mTriangles[tnum].end(); i++){
+			// Reserve the face setting
+			sModel->meshes[tnum]->faces[face_number].material = tnum;
+			REP(id,3){
+				int index = face_number * 3 + id;
+				sModel->meshes[tnum]->faces[face_number].index[id] = index;
+				REP(vertexid,3){
+					sModel->meshes[tnum]->vertices[index][vertexid] = (*i).point[id].coord[vertexid];
+				}
+				sModel->meshes[tnum]->texcos[index][0] = (*i).point[id].tex[0];
+				sModel->meshes[tnum]->texcos[index][1] = (*i).point[id].tex[1];
+			}
+			face_number++;
+		}
+		sModel->meshes[tnum]->nfaces = face_number;
+		sModel->meshes[tnum]->nvertices = face_number * 3;
+//		cout << "mesh" << tnum << ":" << face_number << endl;
+	}
+	SaveXMLFile( filename );
+
+	ostringstream saveName;
+	saveName << filename << ".3ds";
+	lib3ds_file_save( sModel , saveName.str().c_str());
+	com.str("");
+	com.clear(stringstream::goodbit);
+	com << "mv *.bmp *.3ds " << directoryName.str().c_str() << "/";
+	if( system(com.str().c_str() ) );
+}
+
+void MarchingCubes::SaveXMLFile( const char * filename ) {
+	string ostr = "/home/umakatsu/NewARDiorama/ARDiorama/ARData/Models/modelsTextCopy";
+	string istr = "/home/umakatsu/NewARDiorama/ARDiorama/ARData/Models/modelsText";
+	ofstream ofs( ostr.c_str() );
+	ifstream ifs( istr.c_str() );
+	// <!--R Objects End -->というコメントがくるまでmodelsText.txtの内容をコピーする
+	// コメントが現れたら保存するモデルのタグを書き込む
+	// タグ書き込み後，内容のコピーを再開する
+	string buf;
+	while(ifs && getline(ifs, buf)) {
+		// 対応する文字が見つかった場合はそのままコピー
+		if( strstr( buf.c_str() , "Objects End") == NULL){
+			ofs << buf << endl;
+		}
+		// 違う場合はタグ付けをした後にコピー
+		else{
+			cout << "hello" << endl;
+			stringstream tag;
+			tag << "    <Model name=" << "\"R_Model\"" <<  " image=\"Testset.png\"" << " " << "dir=\"ReconstructedObjects/" << filename << "\" file=\"" << filename <<
+					".3ds\" roll=\"0\" pitch=\"0\" yaw=\"0\" />";
+			ofs << tag.str().c_str() << endl;
+			ofs << buf << endl;
+		}
+	}
+	ofs.close();
+	ifs.close();
+	// Update XML file
+	string com = "cp " + ostr + " " + "/home/umakatsu/NewARDiorama/ARDiorama/ARData/Models/models.xml";
+	cout << com << endl;
+	if( system( com.c_str() ) >= 0 );
+	com = "mv " + ostr + " " + istr;
+	cout << com << endl;
+	if( system( com.c_str() ) >= 0 );
+	// Creation of the icon file
+	com = 	"cp ~/NewARDiorama/ARDiorama/ARData/Models/Cat_D/Testset/Testset.png ~/NewARDiorama/ARDiorama/ARData/Models/ReconstructedObjects/" +  static_cast<string>(filename)+ "/";
+	cout << com << endl;
+	if( system( com.c_str() ) >= 0 );
+}
+
+/*
+ * 生成したデータの保存(The format of OBJ and MTL)
+ */
+	void MarchingCubes::saveOBJ(const char * filename){
+		std::ostringstream file_output;
+		ofstream fout(filename , ios::out);
+		uint vertex_number = 1;
+		ostringstream fv;
+		ostringstream fmtl;
+		fv << filename << "vertex";
+		file_output << "cat " <<  fv.str().c_str() << " " << " " << filename << " > " << filename  << "Dat.obj";
+		fmtl << filename << ".mtl";
+		ofstream fvout(fv.str().c_str(),  ios::out);
+		ofstream fmtlout(fmtl.str().c_str(),  ios::out);
+		fvout << "mtllib " << filename << ".mtl" << endl;
+		double wratio = (double)512 / WIDTH;
+		double hratio = (double)256 / HEIGHT;
+		REP(tnum,texSize+1){
+//			fout << "#" << tnum << 	endl;
+			//メッシュの書き込み
+			if( tnum < texSize) {
+				fout << "g obj"<< tnum + 1 << endl;
+				fout << "usemtl mat" << tnum << endl;
+			}
+			std::deque<Triangle>::iterator i;
+			for (i = mTriangles[tnum].begin(); i != mTriangles[tnum].end(); i++) {
+				fout << "f ";
+				fvout << "vn ";
+				REP(id,3) fvout << (*i).normal.coord[id] * (-1) << " ";
+				fvout << endl;
+				for (int j = 0; j < 3; j++) {
+					//メッシュの3次元座標値を書き込み
+					fvout << "v ";
+					REP(id,3) fvout << (*i).point[j].coord[id] << " ";
+					fvout << endl;
+					//メッシュのテクスチャに対応する2次元座標を書き込み
+					fvout << "vt ";
+					fvout << (*i).point[j].tex[0] / static_cast< double >( WIDTH * wratio ) << " ";
+					fvout << (*i).point[j].tex[1] / static_cast< double >( HEIGHT * hratio ) << " ";
+					fvout << endl;
+//					fout << (vertex_number - 1) * 3 + (j + 1) << "/" << (vertex_number - 1) * 3 + ( j + 1 ) << "/" << vertex_number << " ";
+					fout << (vertex_number - 1) * 3 + (j + 1) << "/" << (vertex_number - 1) * 3 + ( j + 1 ) << " ";
+				}
+				fout << endl;
+				vertex_number++;
+			}
+			// Create BMP and MTL File
+			if(tnum < texSize){
+				// Create BMP File
+				uchar *buf	= new uchar[WIDTH * HEIGHT * 3 ];
+				// read color image
+				myReadRawimage( texture.at(tnum)->imRGB , buf);
+				// 上下反転
+				REP(i , HEIGHT/2){
+					REP(j,WIDTH){
+						REP(k,3){
+							swap(buf[(i*WIDTH + j)*3 + k] ,
+								 buf[( ((HEIGHT-1) - i ) * WIDTH + j ) * 3 + k]);
+						}
+					}
+				}
+				std::ostringstream ss;
+//				ss << filename;
+				ss << "tex" << tnum << ".bmp";
+				BmpFileIO	b;
+				b.WriteRGB( ss.str().c_str(), WIDTH , HEIGHT , buf);
+				delete[] buf;
+				// Create MTL File
+				fmtlout << "newmtl mat" << tnum << endl;
+				fmtlout << "Ka 1.0 1.0 1.0 " << endl;
+				fmtlout << "Kd 0.5 0.5 0.5 " << endl;
+				fmtlout << "Ks 1.0 1.0 1.0 " << endl;
+				fmtlout << "Ns 0.0000" << endl;
+				fmtlout << "Tr 1.0000" << endl;
+				fmtlout << "illnum 2" << endl;
+				fmtlout << "map_Kd " << ss.str().c_str() << endl << endl;
+			}
+			fvout << "# Number " << tnum << "vertices" << endl;
+		}
+		cout << "Finished reserved Data" << endl;
+		fout.close();
+		fvout.close();
+		fmtlout.close();
+		if( system(file_output.str().c_str() ) );
+		else;
+}
+
+/*
+ * Map上にオブジェクトを表示する
+ * modeによって表示するオブジェクトのタイプが変わる
+ * 0 : 各視点からはりつけるテクスチャを色で分けて表示
+ * 1 : 法線ベクトル、位置ベクトルを表示
+ * 2 : 各視点からのテクスチャマッピング結果を表示
+ */
+#if 0
+void MarchingCubes::draw( const int & mode ) {
+	if( texture.size() < 1 ){
+		cerr << "No Texture are set" << endl;
+		return;
+	}
+
+	//	//テクスチャ番号を保持する
+	int previous_tex_number = static_cast<int>(texture.size() - 1 );
+	int tex_number = previous_tex_number;
+
+	//テクスチャバインドの初期化
+	if( mode != 1){
+		if(mode == 2){
+			texture.at(tex_number)->tex->bind( );
+		}
+	}
+	std::deque<Triangle>::iterator i;
+	//三角形メッシュがなくなるまで繰り返す
+	for (i = mTriangles.begin(); i != mTriangles.end(); i++) {
+		//貼り付けるテクスチャ番号の設定
+		tex_number = (*i).texture_number;
+		if( tex_number >= static_cast< int >( texture.size() )){
+			cerr << "Tex Number = " << tex_number << "(MAX=" << texture.size() << endl;
+			assert( tex_number < static_cast< int >( texture.size() ));
+		}
+		if(mode == 0){
+			assert(tex_number < 30);
+			if( tex_number >= 0) glColor3dv(ColorMap[tex_number]);
+			else glColor3dv(ColorMap[29]);
+		}
+		//テクスチャ番号が前と変わらない or 貼り付けるテクスチャが存在しない場合
+		//バインドするテクスチャを変更しない
+		if( mode != 1){
+			if( tex_number >= 0 && tex_number != previous_tex_number ){
+				assert(previous_tex_number >= 0);
+				assert(tex_number >= 0);
+				if( mode == 2){
+//						texture.at(previous_tex_number)->tex->unbind();
+					texture.at(tex_number)->tex->bind( );
+				}
+			}
+			if( mode != 1) glBegin(GL_TRIANGLES);
+				for (int j = 0; j < 3; j++) {
+					const double * tex = (double*)&(*i).point[j].tex;
+					//テクスチャが見つかった場合は適切な座標値を割り当てる
+					if(tex_number >= 0){
+						if(mode == 2){
+							glTexCoord2d( tex[ 0 ], tex[ 1 ] );
+						}
+					}
+					//テクスチャが見つからなかった場合は背景領域の座標値を割り当てる
+					else{
+						if(mode == 2){
+							glTexCoord2d( WIDTH-1 , HEIGHT-1 );
+						}
+					}
+					glVertex3dv((double*)&(*i).point[j]);
+				}
+				if(tex_number >= 0) previous_tex_number = tex_number;
+			if( mode != 1) glEnd();
+		}
+	}
+	if(mode == 2){
+		texture.back()->tex->unbind();
+	}
+}
+#else
+void MarchingCubes::draw( const int & mode ) {
+	if( texture.size() < 1 ){
+		cerr << "No Texture are set" << endl;
+		return;
+	}
+
+	//三角形メッシュがなくなるまで繰り返す
+	REP(tnum,texSize+1){
+		std::deque<Triangle>::iterator i;
+		//テクスチャバインド
+		if(mode == 2) if( tnum < texSize ) texture.at(tnum)->tex->bind( );
+		for (i = mTriangles[tnum].begin(); i != mTriangles[tnum].end(); i++) {
+			if(mode == 0){
+				if(tnum < texSize)	glColor3dv(ColorMap[tnum]);
+				else					glColor3dv(ColorMap[29]);
+			}
+			//テクスチャ番号が前と変わらない or 貼り付けるテクスチャが存在しない場合
+			//バインドするテクスチャを変更しない
+			if( mode != 1) glBegin(GL_TRIANGLES);
+				for (int j = 0; j < 3; j++) {
+					const double * tex = (double*)&(*i).point[j].tex;
+					//テクスチャが見つかった場合は適切な座標値を割り当てる
+					if( tnum < texSize){
+						if(mode == 2){
+							glTexCoord2d( tex[ 0 ], tex[ 1 ] );
+						}
+					}
+					//テクスチャが見つからなかった場合は背景領域の座標値を割り当てる
+					else{
+						if(mode == 2){
+							glTexCoord2d( WIDTH-1 , HEIGHT-1 );
+						}
+					}
+//					glVertex3dv((double*)&(*i).point[j]);
+					glVertexVector((*i).point[j].coord);
+				}
+			if( mode != 1) glEnd();
+		}
+	}
+	if(mode == 2) texture.back()->tex->unbind( );
+	glColor3f(0,1,1);
+	glPointSize(10);
+	glBegin(GL_POINTS);
+	glVertexVector(gravity);
+	glEnd();
+}
+#endif
+
+/*
+ * draw object for authoring mode
+ * Drawing phantom object 2011.5.9
+ */
+void MarchingCubes::drawObject( void ) {
+	if( texture.size() < 1 ){
+		cerr << "No Texture are set" << endl;
+		return;
+	}
+	REP(tnum,texSize+1){
+		std::deque<Triangle>::iterator i;
+//		if( tnum < texsize ) texture.at(tnum)->tex->bind( );
+		for (i = mTriangles[tnum].begin(); i != mTriangles[tnum].end(); i++) {
+			glBegin(GL_TRIANGLES);
+				Triangle tri = (*i);
+				for (int j = 0; j < 3; j++) {
+//					const double * tex = (double*)&(*i).point[j].tex;
+					//テクスチャが見つかった場合は適切な座標値を割り当てる
+//					if( tnum < texsize){
+//						glTexCoord2d( tex[ 0 ], tex[ 1 ] );
+//					//テクスチャが見つからなかった場合は背景領域の座標値を割り当てる
+//					}else{
+//						glTexCoord2d( WIDTH-1 , HEIGHT-1 );
+//					}
+					glVertexVector(tri.point[j].coord);
+				}
+			glEnd();
+		}
+	}
+//	texture.back()->tex->unbind( );
+}
+
+void MarchingCubes::createTexture(const ImageType & imRGB , const TooN::SE3<> & se3CFromW){
+	if( texture.size() > MAX_TEXTURE){
+		cout << "Texture are full! " << endl;
+		TextureInfo * buf = texture.front();
+		delete buf;
+		texture.pop_front();
+	}
+	TextureInfo *tmp_texture = new TextureInfo();
+	tmp_texture->silhouette = NULL;
+	tmp_texture->tex = new Texture(imRGB);
+	tmp_texture->camerapose = se3CFromW;
+	tmp_texture->imRGB = imRGB;
+	tmp_texture->texture_number = texture.size();
+	texture.push_back(tmp_texture);
+	cout << "Texture Create : size=" << texture.size( ) << endl;
+}
+
+void MarchingCubes::createTexture(const ImageType & imRGB , const TooN::SE3<> & se3CFromW , uchar * silhouette){
+	if( texture.size() > MAX_TEXTURE){
+		cerr << "Texture are full! " << endl;
+//		TextureInfo * buf = texture.front();
+//		delete buf;
+//		texture.pop_front();
+	}else{
+		TextureInfo *tmp_texture = new TextureInfo();
+		tmp_texture->tex = new Texture(imRGB);
+		tmp_texture->silhouette = silhouette;
+		tmp_texture->camerapose = se3CFromW;
+		tmp_texture->imRGB = imRGB;
+		tmp_texture->texture_number = texture.size();
+		texture.push_back(tmp_texture);
+	}
+}
+
+/*
+ * 	キューブごとの座標値を格納するメソッド
+ * @param v3pos : ボクセルの世界座標系に置ける3次元座標値
+ */
+void MarchingCubes::initGridPoints( GridPoint ***grid )
+{
+//	if (!mGridPoints || !mGridCells) {
+//		return;
+//	}
+//	for (int i = 0; i < SIZE + OFFSET; i += OFFSET) {
+//		for (int j = 0; j < SIZE + OFFSET; j += OFFSET) {
+//			for (int k = 0; k < SIZE + OFFSET; k += OFFSET) {
+//				GridPoint* gridPoint = &mGridPoints[i][j][k];
+//				REP(id,3) gridPoint->coord[id] = grid[i][j][k].coord[id];
+//				gridPoint->val = grid[i][j][k].val;
+//			}
+//		}
+//	}
+	mGridPoints = grid;
+}
+
+void MarchingCubes::initGridCells( void ){
+	if (!mGridPoints || !mGridCells) {
+		return;
+	}
+	/*
+	 * (i,j,k)にある座標のキューブ情報を生成
+	 */
+	for (int i = 0; i < SIZE; i += OFFSET) {
+		for (int j = 0; j < SIZE; j += OFFSET) {
+			for (int k = 0; k < SIZE; k += OFFSET) {
+				GridCell* gridCell = &mGridCells[i][j][k];
+				gridCell->point[0] = &mGridPoints[i  		][j	 		][k  		];
+				gridCell->point[1] = &mGridPoints[i+OFFSET][j			][k 		];
+				gridCell->point[2] = &mGridPoints[i+OFFSET][j			][k+OFFSET];
+				gridCell->point[3] = &mGridPoints[i  		][j  		][k+OFFSET];
+				gridCell->point[4] = &mGridPoints[i  		][j+OFFSET][k 		];
+				gridCell->point[5] = &mGridPoints[i+OFFSET][j+OFFSET][k  		];
+				gridCell->point[6] = &mGridPoints[i+OFFSET][j+OFFSET][k+OFFSET];
+				gridCell->point[7] = &mGridPoints[i  		][j+OFFSET][k+OFFSET];
+			}
+		}
+	}
+}
+
+unsigned int MarchingCubes::getSizeTexture( void ) const{
+	return texture.size();
+}
+
+ImageType MarchingCubes::checkImageRGB( int num ) const{
+	return texture.at(num)->imRGB;
+}
+
+TooN::SE3<> MarchingCubes::getCamemraPoseFromTexture( int num )const{
+	if( num == -1 )	return (texture.back())->camerapose;
+	else{
+		assert( num < static_cast< int >(texture.size()));
+		return (texture.at(num))->camerapose;
+	}
+}
+
+uchar * MarchingCubes::getSilhouetteFromTexture( int num ) const{
+	if( num == -1 )	return (texture.back())->silhouette;
+	else{
+		assert( num < static_cast< int >(texture.size()));
+		return (texture.at(num))->silhouette;
+	}
+}
+
+/*
+ * モデル生成
+ * モデルを破棄する場合は別箇所でdeleteが必要となる
+ */
+Model * MarchingCubes::modelCreate( void ){
+	Model * model = Model::create( texSize );
+	model->copy(mTriangles , texture , texSize);
+	return model;
+}
+
+/*-------------------- below function is private ----------------------*/
+
+int MarchingCubes::polygoniseAndInsert(const GridCell* grid, double isoLevel) {
+	/* 8bitのテーブルの初期化 */
+	int cubeIndex = 0;
+	/*  点の存在判定 */
+	if (grid->point[0]->val > isoLevel) cubeIndex |= 1;
+	if (grid->point[1]->val > isoLevel) cubeIndex |= 2;
+	if (grid->point[2]->val > isoLevel) cubeIndex |= 4;
+	if (grid->point[3]->val > isoLevel) cubeIndex |= 8;
+	if (grid->point[4]->val > isoLevel) cubeIndex |= 16;
+	if (grid->point[5]->val > isoLevel) cubeIndex |= 32;
+	if (grid->point[6]->val > isoLevel) cubeIndex |= 64;
+	if (grid->point[7]->val > isoLevel) cubeIndex |= 128;
+	/* 空領域の場合は終了 */
+	if (EdgeTable[cubeIndex] == 0) {
+		return 0;
+	}
+	/* 補間点の算出 */
+	Point vertices[12];
+	if (EdgeTable[cubeIndex] & 1) {
+		vertices[0] = interpolate(isoLevel, grid->point[0], grid->point[1]);
+	}
+	if (EdgeTable[cubeIndex] & 2) {
+		vertices[1] = interpolate(isoLevel, grid->point[1], grid->point[2]);
+	}
+	if (EdgeTable[cubeIndex] & 4) {
+		vertices[2] = interpolate(isoLevel, grid->point[2], grid->point[3]);
+	}
+	if (EdgeTable[cubeIndex] & 8) {
+		vertices[3] = interpolate(isoLevel, grid->point[3], grid->point[0]);
+	}
+	if (EdgeTable[cubeIndex] & 16) {
+		vertices[4] = interpolate(isoLevel, grid->point[4], grid->point[5]);
+	}
+	if (EdgeTable[cubeIndex] & 32) {
+		vertices[5] = interpolate(isoLevel, grid->point[5], grid->point[6]);
+	}
+	if (EdgeTable[cubeIndex] & 64) {
+		vertices[6] = interpolate(isoLevel, grid->point[6], grid->point[7]);
+	}
+	if (EdgeTable[cubeIndex] & 128) {
+		vertices[7] = interpolate(isoLevel, grid->point[7], grid->point[4]);
+	}
+	if (EdgeTable[cubeIndex] & 256) {
+		vertices[8] = interpolate(isoLevel, grid->point[0], grid->point[4]);
+	}
+	if (EdgeTable[cubeIndex] & 512) {
+		vertices[9] = interpolate(isoLevel, grid->point[1], grid->point[5]);
+	}
+	if (EdgeTable[cubeIndex] & 1024) {
+		vertices[10] = interpolate(isoLevel, grid->point[2], grid->point[6]);
+	}
+	if (EdgeTable[cubeIndex] & 2048) {
+		vertices[11] = interpolate(isoLevel, grid->point[3], grid->point[7]);
+	}
+
+	int triCount = 0;
+	for (int i = 0; TriTable[cubeIndex][i] != -1; i+=3) {
+		Triangle tri;
+		//補間点の座標値の決定
+		tri.point[0] = vertices[TriTable[cubeIndex][i  ]];
+		tri.point[1] = vertices[TriTable[cubeIndex][i+1]];
+		tri.point[2] = vertices[TriTable[cubeIndex][i+2]];
+		//補間点の法線ベクトルの設定
+		calculateNormal(tri);
+		//重心座標の設定
+		REP(j,3) tri.g[j] = (tri.point[0].coord[j] + tri.point[1].coord[j] + tri.point[2].coord[j]) / 3;
+		gravity += tri.g;
+#if MAPMETHOD == 2
+		//メッシュの追加
+		mTriangles_damy[0].push_back(tri);
+#elif MAPMETHOD == 1
+		// メッシュに貼り付けるテクスチャとの対応座標を決定
+		calculateTexture(tri);
+		if( tri.texture_number >= 0) mTriangles[tri.texture_number].push_back(tri);
+		else mTriangles[texSize].push_back(tri);
+#endif
+		triCount++;
+	}
+	return triCount;
+
+}
+
+Point MarchingCubes::interpolate(double isoLevel, const GridPoint* gp1, const GridPoint* gp2) {
+	double mu;
+	Point p;
+//	mu = (isoLevel - gp1->val) / (gp2->val - gp1->val);
+	mu = 0.5;	//ちょうど真ん中の点に補間する
+	//補間点の座標値の決定
+	p.coord[0] = gp1->coord[0] + mu * (gp2->coord[0] - gp1->coord[0]);
+	p.coord[1] = gp1->coord[1] + mu * (gp2->coord[1] - gp1->coord[1]);
+	p.coord[2] = gp1->coord[2] + mu * (gp2->coord[2] - gp1->coord[2]);
+	return p;
+}
+
+/*
+ * 領域の生成
+ */
+void MarchingCubes::allocateTables(void) {
+	if (mGridPoints || mGridCells) {
+		deallocateTables();
+	}
+//	mGridPoints = new GridPoint**[SIZE + OFFSET];
+//	for (int i = 0; i < SIZE + OFFSET; i++) {
+//		mGridPoints[i] = new GridPoint*[SIZE + OFFSET];
+//		for (int j = 0; j < SIZE + OFFSET; j++) {
+//			mGridPoints[i][j] = new GridPoint[SIZE + OFFSET];
+//		}
+//	}
+
+	mGridCells  = new GridCell**[SIZE];
+	for (int i = 0; i < SIZE; i++) {
+		mGridCells[i] = new GridCell*[SIZE];
+		for (int j = 0; j < SIZE; j++) {
+			mGridCells[i][j] = new GridCell[SIZE];
+		}
+	}
+}
+
+/*
+ * 領域の解放
+ */
+void MarchingCubes::deallocateTables(void) {
+	if (mGridPoints) {
+		for (int i = 0; i < SIZE + 1; i++) {
+			for (int j = 0; j < SIZE + 1; j++) {
+				delete [] mGridPoints[i][j];
+			}
+			delete [] mGridPoints[i];
+		}
+		delete [] mGridPoints;
+		mGridPoints = NULL;
+	}
+	if (mGridCells) {
+		for (int i = 0; i < SIZE; i++) {
+			for (int j = 0; j < SIZE; j++) {
+				delete [] mGridCells[i][j];
+			}
+			delete [] mGridCells[i];
+		}
+		delete [] mGridCells;
+		mGridCells = NULL;
+	}
+}
+
+void MarchingCubes::calculateNormal(Triangle& tri) {
+	double a[3], b[3];
+	double length;
+//	//内側を向く
+//	a[0] = tri.point[0].coord[0] - tri.point[1].coord[0];
+//	a[1] = tri.point[0].coord[1] - tri.point[1].coord[1];
+//	a[2] = tri.point[0].coord[2] - tri.point[1].coord[2];
+//	b[0] = tri.point[0].coord[0] - tri.point[2].coord[0];
+//	b[1] = tri.point[0].coord[1] - tri.point[2].coord[1];
+//	b[2] = tri.point[0].coord[2] - tri.point[2].coord[2];
+//	//外側を向く
+	a[0] = tri.point[2].coord[0] - tri.point[0].coord[0];
+	a[1] = tri.point[2].coord[1] - tri.point[0].coord[1];
+	a[2] = tri.point[2].coord[2] - tri.point[0].coord[2];
+	b[0] = tri.point[1].coord[0] - tri.point[0].coord[0];
+	b[1] = tri.point[1].coord[1] - tri.point[0].coord[1];
+	b[2] = tri.point[1].coord[2] - tri.point[0].coord[2];
+	tri.normal.coord[0] = a[1] * b[2] - b[1] * a[2];
+	tri.normal.coord[1] = b[0] * a[2] - a[0] * b[2];
+	tri.normal.coord[2] = a[0] * b[1] - b[0] * a[1];
+	length = sqrt(tri.normal.coord[0]*tri.normal.coord[0] + tri.normal.coord[1]*tri.normal.coord[1] + tri.normal.coord[2]*tri.normal.coord[2]);
+	tri.normal.coord[0] /= length;
+	tri.normal.coord[1] /= length;
+	tri.normal.coord[2] /= length;
+}
+
+/*
+ * 補間点ごとのテクスチャをマッピングする
+ * メンバ変数のテクスチャベクターから読み込み
+ */
+void MarchingCubes::calculateTexture(Triangle & tri)
+{
+	//二次元座標値の退避用変数
+	double w[3][2];
+	REP(id1,3) REP(id2,2) w[id1][id2] = 0.0;
+	//三角形メッシュに貼り付けるテクスチャ番号、境界値を初期化
+	tri.texture_number = -1;
+#if MAPMETHOD == 1
+	tri.check_value = 0.0;		// 面積比較を用いたテクスチャ決定手法で用いる
+#elif MAPMETHOD == 2
+	tri.check_value = DBL_MAX;	// 距離比較を用いたテクスチャ決定手法で用いる
+#endif
+	//適切なテクスチャを探索する
+	int max_texture_number = static_cast< int >( texture.size() );
+	BOOST_FOREACH(TextureInfo *t , texture){
+		const int texture_number = t->texture_number;
+		assert( texture_number >= 0);
+		assert( texture_number <= max_texture_number);
+		bool frag[3];
+		REP(id,3) frag[id] = false;
+		REP(id,3){
+			TooN::Vector< 3 > ver;
+			REP(id1,3) ver[id1] = tri.point[id].coord[id1];
+			//3次元位置を2次元座標系に落とす
+			TooN::Vector< 2 > back = projectionFromWorldToImage(ver , t->camerapose , mpCamera);
+			double address[2];
+			address[0] = (double)back[0];	//width
+			address[1] = (double)back[1];	//height
+			//Check if the projected pixel is in the Image Plane
+			if(address[0] >= 0.0 && address[0] < WIDTH
+			&& address[1] >= 0.0 && address[1] < HEIGHT
+			){
+				//2次元位置を格納する
+				//同時に現時点における二次元位置を退避させる
+				REP(id1,2){
+					w[id][id1]				  = tri.point[id].tex[id1];
+					tri.point[id].tex[id1] = address[id1];
+				}
+				frag[id] = true;
+			}else break;				//1点でも画面内に収まっていない場合はテクスチャをはらない
+		}
+		//3点すべてが画面上に収まっている場合は適切なテクスチャかどうか調べる
+		if( frag[0] && frag[1] && frag[2]){
+			//テクスチャ切り替えが発生
+			if(checkOptimalTextureNumber(tri , texture_number) );
+			//テクスチャ番号に変更はない
+			else REP(id1,3) REP(id2,2) tri.point[id1].tex[id2] = w[id1][id2];
+		}
+		//テクスチャ座標値が切り替えられた頂点を書き戻す
+		else REP(id1,3)
+				if(frag[id1])
+					REP(id2,2) tri.point[id1].tex[id2] = w[id1][id2];
+	}
+}
+
+/*
+ * メッシュに貼り付ける適切なテクスチャを選ぶメソッド
+ * @param tri : テクスチャ貼り付けの対象となっている三角形メッシュ
+ */
+//int MarchingCubes::checkOptimalTexture( Triangle & tri , const int & mode){
+//	int tex_number = -1;
+//	double check_val = DBL_MIN;
+////	ofstream fout("TextureData.txt" , ios::out | ios::app);
+//	REP(t,texture.size()){
+//		// Definition of a coordinate of camera
+//		TooN::Vector< 3 > cam = texture.at(t)->camerapose.inverse().get_translation();
+//		// Definition of an triangle vector
+//		TooN::Vector< 3 > patch = tri.point[0].coord;
+//		// Definition of a directional vector for camera
+//		TooN::Vector< 3 > v =  cam - patch;
+//		// Definition of a normal vector aim for object outside
+//		TooN::Vector< 3 > n_vector = tri.normal.coord;
+//
+//		double ip = n_vector * v;
+//
+//		if( mode == 1){
+//			glLineWidth( 5.0 );
+//			glBegin(GL_LINES);
+//				glColor3d(1.0 , 1.0 , 0.0);
+//				glVertexVector(patch);
+//				glVertex3d(0.0 , 0.0 , 0.0);
+//				glColor3d(1.0 , 0.0 , 0.0);
+//				glVertexVector(patch);
+//				glVertexVector(patch+n_vector);
+//			glEnd();
+//			glFlush();
+//		}
+////		 Texture mapping
+//		if( ip > EPSILON ){
+//			//もっとも適切と思われるテクスチャを選ぶ
+//			double cosTheta = ip / ( norm3(v) );
+//			double val = acos(cosTheta);
+//			if( val < check_val ){
+//				check_val = val;
+//				tex_number = t;
+//			}
+//		}
+//	}
+////	fout.close();
+//	return tex_number;
+//}
+
+/*
+ * メッシュに貼り付ける適切なテクスチャを選ぶメソッド
+ * @param tri : テクスチャ貼り付けの対象となっている三角形メッシュ
+ */
+bool MarchingCubes::checkOptimalTextureNumber( Triangle & tri , const int & texture_num)
+{
+#if MAPMETHOD == 1
+	// Definition of a coordinate of camera
+	TooN::Vector< 3 > cam = texture.at(texture_num)->camerapose.inverse().get_translation();
+	// Definition of an triangle vector
+	TooN::Vector< 3 > patch = tri.point[0].coord;
+	// Definition of a directional vector for camera
+	TooN::Vector< 3 > v =  cam - patch;
+	// Definition of a normal vector aim for object outside
+	TooN::Vector< 3 > n_vector = tri.normal.coord;
+	// Calculate inner product
+	double ip = n_vector * v;
+#elif MAPMETHOD == 2
+	double val = norm3( texture.at(texture_num)->camera_ref - tri.g );
+#endif
+	 // Texture mapping
+	 // if inner product between normal vector and directional vector is sharp angel
+#if MAPMETHOD == 1
+	if( ip > 0.0 ){
+		//もっとも適切と思われるテクスチャを選ぶ
+		double val = calculateTriangleArea(tri);
+		if( val >  tri.check_value ){
+			assert( texture_num >= 0);
+			tri.check_value = val;
+			tri.texture_number = texture_num;
+			return true;
+		}
+	}
+#elif MAPMETHOD == 2
+	if( val < tri.check_value ){
+		assert( texture_num >= 0);
+		tri.check_value = val;
+		tri.texture_number = texture_num;
+		return true;
+	}
+#endif
+	return false;
+}
+
+void MarchingCubes::checkTexturePose(){
+	BOOST_FOREACH(TextureInfo *t , texture){
+		cout << "No." << t->texture_number << endl << t->camerapose << endl;
+	}
+}
+
+double MarchingCubes::calculateTriangleArea(const Triangle & tri ){
+	double p1[2];
+	double p2[2];
+	REP(id,2){
+		p1[id] = tri.point[2].tex[id] - tri.point[0].tex[id];
+		p2[id] = tri.point[2].tex[id] - tri.point[1].tex[id];
+	}
+	return (0.5 * fabs( p1[0]*p2[1] - p1[1]*p2[0] ) );
+}
+}

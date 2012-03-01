@@ -1,0 +1,32 @@
+<?xml version="1.0" ?>
+<PTAMM_Model_DB version="1.0">
+  <Category name="Category A" image="Cat_A/A.png">
+    <Model name="Cone" image="cone.png" dir="Cat_A/Cone" file="cone.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="Cube" image="cube.png" dir="Cat_A/Cube" file="cube.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="Sphere" image="sphere.png" dir="Cat_A/Sphere" file="sphere.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="Torus" image="torus.png" dir="Cat_A/Torus" file="torus.3ds" roll="0" pitch="0" yaw="0" />
+  </Category>
+  <Category name="Category B" image="Cat_B/B.png">
+    <Model name="TeaTable" image="teatable.jpg" dir="Cat_B/Teatable" file="teatable.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="Laptop" image="laptop.jpg" dir="Cat_B/laptop1" file="laptop1.3ds" roll="0" pitch="0" yaw="0" />
+  </Category>
+  <Category name="Category C" image="Cat_C/C.png">
+    <Model name="GingerBreadHouse" image="gingerhouse.jpg" dir="Cat_C/GingerBreadHouse" file="GingerbreadHouse.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="FairyHouse" image="fairyhouse.jpg" dir="Cat_C/FairyHouse" file="FairyHouse.3ds" roll="0" pitch="0" yaw="0" />
+  </Category>
+  <Category name="Category D" image="Cat_D/D.png">
+    <Model name="Testset" image="Testset.png" dir="Cat_D/Testset" file="Testset.3ds" roll="0" pitch="0" yaw="0" />
+  </Category>
+  <Category name="Category E" image="Cat_E/E.png">
+  </Category>
+  <Category name="Category Origin" image="ReconstructedObjects/Reconstruction.png"> 
+    <!--R Objects Start -->
+    <Model name="R_Model" image="Testset.png" dir="ReconstructedObjects/Voxel_2011_77_1929" file="Voxel_2011_77_1929.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="R_Model" image="Testset.png" dir="ReconstructedObjects/Voxel_2011_719_430" file="Voxel_2011_719_430.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="R_Model" image="Testset.png" dir="ReconstructedObjects/Voxel_2011_726_1246" file="Voxel_2011_726_1246.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="R_Model" image="Testset.png" dir="ReconstructedObjects/Voxel_2011_82_1441" file="Voxel_2011_82_1441.3ds" roll="0" pitch="0" yaw="0" />
+    <Model name="R_Model" image="Testset.png" dir="ReconstructedObjects/Voxel_2011_1011_1627" file="Voxel_2011_1011_1627.3ds" roll="0" pitch="0" yaw="0" />
+    <!--R Objects End -->
+  </Category>
+</PTAMM_Model_DB>
+
